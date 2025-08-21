@@ -1,12 +1,12 @@
 # TSS-PV Benchmark
 This readme is W.I.P
+**Prerequisites**
+1. AVX2 enabled CPU
+2. Python 3.10
+3. Rustc 1.83.0
+4. Cargo 1.83.0
+5. Maturin 1.83
 
-1. Run the venv:
-   ``
-   source ./venv/bin/activate
-   ``
-   - Note 1: deactivate conda if necessary: `conda deactivate`
-   - Note 2: `Dalek-Curve25519` is wrapped using `Pyo3` and `Maturin` as `Curve25519_Python` package in `./venv/lib/python3.10/site-packages/curve25519_python`
-
+**Benchmark**
+1. Run the build script: `./curve25519_python/build_script.sh`
 2. Now it is ready to run the benchmark: `python3 ./benchmark/benchmark.py`
-3. Historical versions can be found in `./history`
