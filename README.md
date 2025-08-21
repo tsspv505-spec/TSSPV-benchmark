@@ -1,5 +1,4 @@
 # TSS-PV Benchmark
-This readme is W.I.P
 **Prerequisites**
 1. AVX2 enabled CPU
 2. Python 3.10
