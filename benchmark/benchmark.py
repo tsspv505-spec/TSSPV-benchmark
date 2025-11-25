@@ -1,102 +1,134 @@
 #!/usr/bin/env python3
 """
-Tiny-TSS-PV v13 ▸ benchmark with time / muls / heap (tracemalloc) usage
-────────────────────────────────────────────────────────────────────
-Implements TSS-PV Ver 1.0 with ElGamal encryption for dummy shares.
-Fixes TrVer and ShD to correctly check cm consistency using T[i][7].
+Tiny-TSS-PV v16 (n = m + t - 1) ▸ benchmark (analysis-aligned counters)
+────────────────────────────────────────────────────────────────────────
+This revision aligns per-phase #mul with the paper’s Efficiency Analysis:
+ • Recon counts only t mults; VerRS counted separately (4 mults)
+ • Trace is split into R-only (box) and VerRS (public checks)
+ • TrVer is split into excl-box (VerSD+VerSS) and R-only (box replays)
+Other features preserved: medians, CPU pinning (best-effort), peak RSS.
 """
 
-import secrets, hashlib, time, random, gc, tracemalloc, curve25519_python as cp
+import os, sys, platform, secrets, hashlib, time, random, gc, statistics, resource
+import curve25519_python as cp
 
-# ────────── Heap tracing ──────────
-tracemalloc.start()
-def heap_kib():
-    cur, peak = tracemalloc.get_traced_memory()
-    return cur // 1024, peak // 1024
-def banner():
-    gc.collect()
-    cur, peak = heap_kib()
-    print(f"   [heap] {cur:6d} KiB  (peak {peak} KiB)")
+# ======== (optional) CPU pinning ========
+def pin_to_first_cpu():
+    try:
+        if hasattr(os, "sched_setaffinity"):
+            cpus = os.sched_getaffinity(0)
+            first = min(cpus)
+            os.sched_setaffinity(0, {first})
+            return True
+        return False
+    except Exception:
+        return False
 
-# ────────── Normalise to bytes ──────────
-def E(v):
+PINNED = pin_to_first_cpu()
+
+# ======== process memory (peak RSS) ========
+def peak_rss_kib():
+    """Peak RSS in KiB (ru_maxrss is KiB on Linux, bytes on macOS/BSD)."""
+    ru = resource.getrusage(resource.RUSAGE_SELF)
+    val = ru.ru_maxrss
+    if platform.system() == "Darwin":
+        return val // 1024
+    return val
+
+# ======== deterministic enc helpers ========
+def E(v):  # normalize to bytes
     return v if isinstance(v, (bytes, bytearray)) else bytes(v)
 
-# ────────── Global counters ──────────
-CNT = RB_CNT = 0
-def bump():
-    global CNT
-    CNT += 1
-def rb_bump(d):
-    global RB_CNT
-    RB_CNT += d
-def reset():
+# ======== global counters ========
+CNT = 0
+def cnt_reset():
     global CNT
     CNT = 0
-def rb_reset():
-    global RB_CNT
-    RB_CNT = 0
+def cnt_snapshot():
+    return CNT
 
-# ────────── Curve wrappers ──────────
-B = b'\x58' + b'\x66'*31
-def P(A, B):
-    return E(cp.point_addition(A, B))
+# ======== Curve wrappers ========
+B   = b'\x58' + b'\x66'*31           # Edwards basepoint
+ONE = b'\x01' + b'\0'*31
+ID  = E(cp.scalar_multiply(b"\0" * 32))  # identity element (0*B)
+
+def P(A, B_):            return E(cp.point_addition(A, B_))
 def Pm(s, P_):
-    bump()
+    global CNT
+    CNT += 1
     return E(cp.point_multiply(s, P_))
 def Sm(s):
-    bump()
+    global CNT
+    CNT += 1
     return E(cp.scalar_multiply(s))
-def S2(a, b):
-    return E(cp.scalar_multiply_scalar(a, b))
-def Inv(z):
-    return E(cp.scalar_inverse(z))
-def Sub(a, b):
-    return E(cp.scalar_subtraction(a, b))
-def rand():
-    return secrets.token_bytes(32)
-def cm(r, s):
-    return P(Pm(r, H1), Pm(s, H2))
-def rho(h, r, S):
-    return P(Pm(r, h), S)
-def _sample(x, g, r, S):
-    return (x, rho(hp(x, g), r, S))
+def S2(a, b):            return E(cp.scalar_multiply_scalar(a, b))
+def Inv(z):              return E(cp.scalar_inverse(z))
+def AddS(a, b):          return E(cp.scalar_addition(a, b))
+def Sub(a, b):           return E(cp.scalar_subtraction(a, b))
+def rand():              return secrets.token_bytes(32)
 
-ONE = b'\x01' + b'\0'*31
+# Generators for commitments (counted outside measured windows)
 H1, H2 = Pm(b'\x02'+b'\0'*31, B), Pm(b'\x03'+b'\0'*31, B)
-ID = Sm(b"\0" * 32)
 
-# ────────── ElGamal encryption ──────────
-def elgamal_encrypt(m, pk, sk=None):
-    """Encrypt m (point) under pk (public key point) on Curve25519."""
-    k = rand()
-    c1 = Pm(k, B)
-    c2 = P(m, Pm(k, pk))
-    return (c1, c2, sk) if sk else (c1, c2)
-
-# ────────── Polynomial & sharing helpers ──────────
+# ======== polynomial & sharing helpers ========
 def gpoly(t):
+    """Return α_1..α_{t-1} as group elements (points)."""
     return [Sm(rand()) for _ in range(t)]
+
 def hp(x, g):
-    acc, xp = ONE, x
+    """Compute f(x) = prod_{j=1}^{|g|} α_j^{x^j} in additive group form."""
+    acc, xp = ID, x
     for gk in g:
         acc = P(acc, Pm(xp, gk))
-        xp = S2(xp, x)
+        xp  = S2(xp, x)
     return acc
 
-def proof(h, p, cm_, r, s):
+def rho(h, r, S):
+    """h^r ⋅ S  (additive r*h + S)."""
+    return P(Pm(r, h), S)
+
+# ======== hash (domain-separated) ========
+def H(*elts):
+    return hashlib.sha256(b''.join(elts)).digest()[:32]
+
+# ======== NIZKs ========
+def proof_share(f_i, p_i, cr, cs, r, s):
+    """
+    Proves: p_i = f_i^r ⋅ g^s   ∧   cr = h1^r   ∧   cs = h2^s
+    FS challenge binds (f_i, p_i, cr, cs) with a domain tag.
+    """
     kr, ks = rand(), rand()
-    Acm, Ar = P(Pm(kr, H1), Pm(ks, H2)), P(Pm(kr, h), Pm(ks, B))
-    c = hashlib.sha256(b''.join([cm_, p, Acm, Ar])).digest()[:32]
-    zr, zs = Sub(kr, S2(c, r)), Sub(ks, S2(c, s))
-    return c, zr, zs
+    A_p  = P(Pm(kr, f_i), Pm(ks, B))
+    A_cr = Pm(kr, H1)
+    A_cs = Pm(ks, H2)
+    c = H(b"share", f_i, p_i, cr, cs, A_p, A_cr, A_cs)
+    zr = Sub(kr, S2(c, r))
+    zs = Sub(ks, S2(c, s))
+    return (c, zr, zs)
 
-def check(h, p, cm_, π):
+def check_share(f_i, p_i, cr, cs, π):
     c, zr, zs = π
-    Mc = P(Pm(c, cm_), P(Pm(zr, H1), Pm(zs, H2)))
-    Mr = P(Pm(c, p), P(Pm(zr, h), Pm(zs, B)))
-    return hashlib.sha256(b''.join([cm_, p, Mc, Mr])).digest()[:32] == c
+    M_p  = P(Pm(c, p_i), P(Pm(zr, f_i), Pm(zs, B)))
+    M_cr = P(Pm(c, cr), Pm(zr, H1))
+    M_cs = P(Pm(c, cs), Pm(zs, H2))
+    return H(b"share", f_i, p_i, cr, cs, M_p, M_cr, M_cs) == c
 
+def proof_psi(S, cs, s):
+    """Proves: S = g^s  ∧  cs = h2^s (global, counted outside dealer window)."""
+    k = rand()
+    A_S  = Pm(k, B)
+    A_cs = Pm(k, H2)
+    c = H(b"psi", S, cs, A_S, A_cs)
+    z = Sub(k, S2(c, s))
+    return (c, z)
+
+def check_psi(S_prime, cs, ψ):
+    c, z = ψ
+    M_S  = P(Pm(c, S_prime), Pm(z, B))
+    M_cs = P(Pm(c, cs),      Pm(z, H2))
+    return H(b"psi", S_prime, cs, M_S, M_cs) == c
+
+# ======== Interpolation (Δ_j at 0) ========
 def montgomery_batch_invert(values):
     k = len(values)
     partials = [ONE]
@@ -110,6 +142,10 @@ def montgomery_batch_invert(values):
     return invs
 
 def recon(shs):
+    """
+    shs: list[(x_j, y_j)]
+    Computes S = ∏_j y_j^{Δ_j} with Δ_j = ∏_{i≠j} x_i / (x_i - x_j)
+    """
     acc = ID
     k = len(shs)
     denoms = [ONE] * k
@@ -126,168 +162,251 @@ def recon(shs):
         acc = P(acc, Pm(l, yj))
     return acc
 
-# ────────── Verification helpers ──────────
-def ShD(T, cm):
-    if any(t[7] != cm for t in T):
-        return False
-    for fx_i, fz_i, px_i, pz_i, π_i, πp_i, _, _ in T:
-        if not (check(fx_i, px_i, cm, π_i) and check(fz_i, pz_i, cm, πp_i)):
+# ======== Public verification ========
+def VerSD(T):
+    """All rows share same (cr,cs) and each π_i verifies."""
+    if not T: return False
+    cr0, cs0 = T[0][4]
+    for (f_i, p_i, π_i, ψ_i, (cr, cs)) in T:
+        if cr != cr0 or cs != cs0:
+            return False
+        if not check_share(f_i, p_i, cr, cs, π_i):
             return False
     return True
 
-def ShS(sh, T, g):
+def VerSS(sh, T, g):
+    """Recompute f(x), find matching row, check y==p_i and verify π_i."""
+    if not T: return False
     x, y = sh
-    fx = hp(x, g)
-    for fx_j, fz_j, px_j, pz_j, π_j, πp_j, _, cm_j in T:
-        if (fx == fx_j and y == px_j):
-            if check(fx, px_j, cm_j, π_j):
-                return True
-        elif (fx == fz_j and y == pz_j):
-            if check(fx, pz_j, cm_j, πp_j):
-                return True
-    return False  # No match found
+    ftilde = hp(x, g)
+    for (f_i, p_i, π_i, ψ_i, (cr, cs)) in T:
+        if f_i == ftilde:
+            if y != p_i:
+                return False
+            return check_share(ftilde, y, cr, cs, π_i)
+    return False
 
-# ────────── Reconstruction oracle ──────────
-def Rbox(k, embeds, T, g, cm):
+def VerRS(S_prime, T):
+    """Check global ψ on (S', cs)."""
+    if not T: return False
+    _, _, _, ψ, (cr, cs) = T[0]
+    return check_psi(S_prime, cs, ψ)
+
+# ======== Reconstruction oracle (Rbox) ========
+def Rbox_mu(t, embeds, T, g):
     def R(shares):
         shares = [shares] if isinstance(shares, tuple) else list(shares)
-        valid_shares = embeds[:]
-        for x, y in shares: #t-f shares * t+5 muls
-            if not ShS((x, y), T, g):
+        # Keep embedded first; prevent overriding by later duplicates
+        uniq = {}
+        for sh in embeds:
+            x, y = sh
+            if x not in uniq:
+                uniq[x] = y
+        # Validate submitted shares, build uniq set
+        for sh in shares:
+            if not VerSS(sh, T, g):
                 return None
-            valid_shares.append((x, y))
-        uniq = dict(valid_shares)
-        if len(uniq) < k:
+            x, y = sh
+            if x not in uniq:
+                uniq[x] = y
+        if len(uniq) < t:
             return None
-        before, t0 = CNT, time.perf_counter()
-        res = recon(list(uniq.items())[:k]) #t shares
-        # rb_bump(CNT - before)
-        globals()['RB_TIME'] = globals().get('RB_TIME', 0.0) + (time.perf_counter() - t0)
-        return res
+        return recon(list(uniq.items())[:t])
     return R
 
-# ────────── Helper for dummy share selection ──────────
-def select_dummy_shares(dsh, shv, t, f):
-    banned = {x for x, _ in shv}
-    return [(z, pz) for z, pz in random.sample(dsh, t - f - 1) if z not in banned]
+# ======== Dummy selection ========
+def select_dummies(dsh, banned_xs, k):
+    picks = []
+    for z, pz in random.sample(dsh, min(k, len(dsh))):
+        if z not in banned_xs:
+            picks.append((z, pz))
+            if len(picks) == k:
+                break
+    return picks
 
-# ────────── Trace / TrVer ──────────
-def Trace(tk, T, g, f, t, R, cm):
-    ζ, dsh, shv = tk
-    r, s, S = ζ
-    I = set(range(len(shv)))
-    DSH = select_dummy_shares(dsh, shv, t, f)
-    for idx, sh in enumerate(shv):
-        if R(DSH + [sh]) == S:
-            I.discard(idx)
-    return sorted(I), [shv[i] for i in I]
+# ======== One complete run (returns per-phase timings & counts) ========
+def one_run(m, t, f):
+    # α_1..α_{t-1}
+    g = gpoly(t - 1)
 
-def TrVer(vk, I, T, π, g, f, t, R, cm_):
-    ζ, dsh, shv = vk
-    r, s, S = ζ
-    if any(t[7] != cm_ for t in T):
-        return False
-    if cm_ != cm(r, s) or S != Sm(s): #3 muls
-        return False
-    if not all(sh in shv for sh in π):
-        return False
-    for x, px in shv:
-        if px != rho(hp(x, g), r, S): #nt muls
-            return False
-    for z, pz in dsh:
-        if pz != rho(hp(z, g), r, S): #nt muls
-            return False
-    DSH = select_dummy_shares(dsh, shv, t, f)
-    for idx in I:
-        x, y = shv[idx]
-        if not any((y == px_j) or (y == pz_j) for _, _, px_j, pz_j, _, _, _, _ in T):
-            return False
-        if R(DSH + [shv[idx]]) == S: #(t+5)muls per ShS on 1 share. There are t-f shares fed to R
-            return False
-    return True
+    # Party and dummy indices (pairwise distinct)
+    xs  = [(i + 1).to_bytes(32, 'little') for i in range(m)]
+    zxs = [(m + 1 + j).to_bytes(32, 'little') for j in range(t - 1)]
 
-# ────────── Benchmark harness ──────────
-def run(n, k, f):
-    assert 0 < f < k - 1
-    print(f"\n== n={n} k={k} f={f} ==")
-    g = gpoly(k - 1)
-    xs = [(i + 1).to_bytes(32, 'little') for i in range(n)]
-
-    # Player share generation
-    reset()
+    # Parties/dummies compute f(x)
+    cnt_reset()
     t0 = time.perf_counter()
-    fx = [hp(x, g) for x in xs]
-    print(f"[share ] {1e3*(time.perf_counter()-t0)/n:7.1f} ms {CNT//n:3d} mul/ply")
-    banner()
+    fx = [hp(x, g)  for x in xs]
+    fz = [hp(z, g)  for z in zxs]
+    share_ms = 1e3 * (time.perf_counter() - t0)
+    share_cnt = cnt_snapshot()
 
-    # Dealer operations
+    # Dealer picks r,s; global S, C, ψ (global cost left uncounted by design)
     r, s = rand(), rand()
-    S = Sm(s)
-    sk = rand()
-    pk = Pm(sk, B)
-    reset()
-    cm_ = cm(r, s)
+    S    = Sm(s)                 # global
+    cr, cs = Pm(r, H1), Pm(s, H2)  # global
+    ψ = proof_psi(S, cs, s)      # global
+
+    # Dealer per-row work: p_i and π_i
+    cnt_reset()
     t0 = time.perf_counter()
-    zs = [rand() for _ in range(n)]
-    fz = [hp(z, g) for z in zs]
     T = []
+    for x, f_i in zip(xs, fx):  # parties
+        p_i = rho(f_i, r, S)
+        π_i = proof_share(f_i, p_i, cr, cs, r, s)
+        T.append((f_i, p_i, π_i, ψ, (cr, cs)))
     dsh = []
-    for i in range(n):
-        px_i = rho(fx[i], r, S)
-        π_i = proof(fx[i], px_i, cm_, r, s)
-        pz_i = rho(fz[i], r, S)
-        πp_i = proof(fz[i], pz_i, cm_, r, s)
-        T.append((fx[i], fz[i], px_i, pz_i, π_i, πp_i, (), cm_))
-        dsh.append((zs[i], pz_i))
-    shv = [(x, t[2]) for x, t in zip(xs, T)]
-    print(f"[dealer] {1e3*(time.perf_counter()-t0):7.1f} ms {CNT:4d} mul")
-    banner()
+    for z, f_i in zip(zxs, fz):  # dummies
+        p_i = rho(f_i, r, S)
+        π_i = proof_share(f_i, p_i, cr, cs, r, s)
+        T.append((f_i, p_i, π_i, ψ, (cr, cs)))
+        dsh.append((z, p_i))
+    shv = [(x, p) for (x, (f, p, _, _, _)) in zip(xs, T)]  # (x, p)
+    dealer_ms = 1e3*(time.perf_counter()-t0)
+    dealer_cnt = cnt_snapshot()
 
-    # VerifySD
-    reset()
+    # VerSD (7n mults)
+    cnt_reset()
     t0 = time.perf_counter()
-    ok = ShD(T, cm_)
-    print(f"[ShD ] {1e3*(time.perf_counter()-t0):7.1f} ms {CNT:4d} mul ok={ok}")
-    banner()
+    ok_vsd = VerSD(T)
+    vsd_ms = 1e3*(time.perf_counter()-t0)
+    vsd_cnt = cnt_snapshot()
 
-    # VerifySS
-    reset()
+    # VerSS on t random shares from all rows (t*(t+6) mults)
+    all_shares = shv + dsh
+    sample_shs = random.sample(all_shares, t)
+    cnt_reset()
     t0 = time.perf_counter()
-    allok = all(ShS(sh, T, g) for sh in shv[:k])
-    print(f"[ShS ] {1e3*(time.perf_counter()-t0):7.1f} ms {CNT:4d} mul all={allok}")
-    banner()
+    allok_vss = all(VerSS(sh, T, g) for sh in sample_shs)
+    vss_ms = 1e3*(time.perf_counter()-t0)
+    vss_cnt = cnt_snapshot()
 
-    # Reconstruction
-    rb_reset()
-    globals()['RB_TIME'] = 0.0
-    R = Rbox(k, random.sample(shv, f), T, g, cm_)
-    reset()
+    # Reconstruction ONLY (t mults)
+    cnt_reset()
     t0 = time.perf_counter()
-    reconstructed = recon(shv[:k])
-    ok = reconstructed == S
-    print(f"[Recon ] {1e3*(time.perf_counter()-t0):7.1f} ms {CNT:4d} mul ok={ok}")
-    banner()
+    S_rec = recon(shv[:t])
+    recon_ms = 1e3*(time.perf_counter()-t0)
+    recon_cnt = cnt_snapshot()
 
-    # Trace
-    reset()
-    tk = ((r, s, S), dsh, shv)
+    # VerRS ONLY (4 mults)
+    cnt_reset()
     t0 = time.perf_counter()
-    I, π = Trace(tk, T, g, f, k, R, cm_)
-    trace_mul = CNT
-    trace_ms = 1e3 * (time.perf_counter() - t0)
-    print(f"[Trace ] {trace_ms:7.1f} ms {trace_mul:4d} mul |I|={len(I)}")
-    banner()
+    ok_vr = VerRS(S_rec, T)
+    vr_ms = 1e3*(time.perf_counter()-t0)
+    vr_cnt = cnt_snapshot()
 
-    # TrVer
-    reset()
+    # R box and tracing — split into R-only vs VerRS(public)
+    embeds = random.sample(shv, f)
+    R = Rbox_mu(t, embeds, T, g)
+    banned = {x for x,_ in shv}
+    DSH = select_dummies(dsh, banned, t - f - 1)
+    assert len(DSH) == t - f - 1, "insufficient dummy shares"
+
+    # Trace: R-only
+    S_out = []
+    cnt_reset()
     t0 = time.perf_counter()
-    ok = TrVer(tk, I, T, π, g, f, k, R, cm_)
-    trv_mul = CNT
-    trv_ms = 1e3 * (time.perf_counter() - t0)
-    print(f"[TrVer ] {trv_ms:7.1f} ms {trv_mul:4d} mul ok={ok}")
-    banner()
+    for sh in shv:
+        S_i = R(DSH + [sh])
+        S_out.append(S_i)
+    trace_r_ms = 1e3*(time.perf_counter()-t0)
+    trace_r_cnt = cnt_snapshot()
 
-# ────────── Entry ──────────
+    # Trace: VerRS over non-leaker outputs; produce I and Π
+    I = set(range(len(shv)))
+    cnt_reset()
+    t0 = time.perf_counter()
+    for idx, S_i in enumerate(S_out):
+        if S_i is not None and VerRS(S_i, T):
+            I.discard(idx)
+    trace_vr_ms = 1e3*(time.perf_counter()-t0)
+    trace_vr_cnt = cnt_snapshot()
+    Π = [shv[i] for i in sorted(I)]
+
+    # TrVer: excl-box = VerSD + VerSS(all rows)
+    cnt_reset()
+    t0 = time.perf_counter()
+    ok_vsd2 = VerSD(T)
+    all_rows_ok = all(VerSS(sh, T, g) for sh in (shv + dsh))
+    trv_excl_ms = 1e3*(time.perf_counter()-t0)
+    trv_excl_cnt = cnt_snapshot()
+    ok_trv_prefix = ok_vsd2 and all_rows_ok
+
+    # TrVer: R-only replays on accused (no VerRS if accusations are correct)
+    cnt_reset()
+    t0 = time.perf_counter()
+    # Fresh DSH for replay
+    DSH2 = select_dummies(dsh, banned, t - f - 1)
+    for idx in sorted(I):
+        _ = R(DSH2 + [shv[idx]])  # should return None for colluders
+    trv_r_ms = 1e3*(time.perf_counter()-t0)
+    trv_r_cnt = cnt_snapshot()
+
+    ok_trv = ok_trv_prefix  # in the success case, R returns None on replays
+
+    return {
+        "share_ms": share_ms, "share_cnt": share_cnt,
+        "dealer_ms": dealer_ms, "dealer_cnt": dealer_cnt,
+        "vsd_ms": vsd_ms, "vsd_cnt": vsd_cnt, "ok_vsd": ok_vsd,
+        "vss_ms": vss_ms, "vss_cnt": vss_cnt, "allok_vss": allok_vss,
+        "recon_ms": recon_ms, "recon_cnt": recon_cnt,
+        "vr_ms": vr_ms, "vr_cnt": vr_cnt, "ok_vr": ok_vr,
+        "trace_r_ms": trace_r_ms, "trace_r_cnt": trace_r_cnt,
+        "trace_vr_ms": trace_vr_ms, "trace_vr_cnt": trace_vr_cnt,
+        "I_len": len(I),
+        "trv_excl_ms": trv_excl_ms, "trv_excl_cnt": trv_excl_cnt,
+        "trv_r_ms": trv_r_ms, "trv_r_cnt": trv_r_cnt, "ok_trv": ok_trv,
+    }
+
+# ======== Aggregate utilities ========
+def med(values): return statistics.median(values)
+
+def pretty_report(m, t, f, trials, res_list):
+    n_total = m + (t - 1)
+    print(f"\n== n={n_total} (total) | m={m} (real) | t={t} | f={f} | trials={trials} | pinned={PINNED} ==")
+    def row(label, key_ms, key_cnt, per_share=False):
+        ms = med([r[key_ms] for r in res_list])
+        cnt = med([r[key_cnt] for r in res_list])
+        if per_share:
+            print(f"[{label:8}] {ms/n_total:7.1f} ms/share   {int(cnt//n_total):3d} mul/share")
+        else:
+            print(f"[{label:8}] {ms:7.1f} ms         {int(cnt):5d} mul (median)")
+    # Sharing & dealer
+    row("share",  "share_ms",  "share_cnt",  per_share=True)
+    row("dealer", "dealer_ms", "dealer_cnt")
+    # Public verification
+    row("VerSD",  "vsd_ms",    "vsd_cnt")
+    row("VerSS",  "vss_ms",    "vss_cnt")
+    # Reconstruction vs VerRS (separated)
+    row("Recon",  "recon_ms",  "recon_cnt")
+    row("VerRS", "vr_ms",     "vr_cnt")
+    # Trace: split
+    row("Trace[R]",  "trace_r_ms",  "trace_r_cnt")
+    row("Trace[VR]", "trace_vr_ms", "trace_vr_cnt")
+    # TrVer: split
+    row("TrVer[x]",  "trv_excl_ms", "trv_excl_cnt")
+    row("TrVer[R]",  "trv_r_ms",    "trv_r_cnt")
+    # Status
+    ok_vsd = all(r["ok_vsd"] for r in res_list)
+    ok_vr  = all(r["ok_vr"]  for r in res_list)
+    ok_trv = all(r["ok_trv"] for r in res_list)
+    print(f"   [ok?] VerSD={ok_vsd}  VerRS={ok_vr}  TrVer={ok_trv}")
+    print(f"   [RSS ] peak {peak_rss_kib():,} KiB")
+
+# ======== Main ========
 if __name__ == "__main__":
-    for n, k, f in [(32, 17, 11), (64, 33, 22), (128, 65, 43), (256, 129, 85)]:
-        run(n, k, f)
+    WARMUP  = 1
+    TRIALS  = 10
+    random.seed(1337)
+
+    if not PINNED:
+        print("[warn] CPU pinning not available; results may vary. Consider `taskset -c 0 python3 ...`.", file=sys.stderr)
+
+    configs = [(32, 17, 11), (64, 33, 22), (128, 65, 43), (256, 129, 85)]
+    for (m, t, f) in configs:
+        for _ in range(WARMUP):
+            _ = one_run(m, t, f)
+        gc.disable()
+        results = [one_run(m, t, f) for _ in range(TRIALS)]
+        gc.enable()
+        pretty_report(m, t, f, TRIALS, results)
