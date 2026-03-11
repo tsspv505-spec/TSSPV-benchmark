@@ -3,7 +3,7 @@
 Tiny-TSS-PV v18 (n = m + t - 1) ▸ benchmark (BL-NIZK integrated)
 ────────────────────────────────────────────────────────────────────────
 Updates: (2025-12-23)
- • Added BLPrf (Bridge-and-Link Prove) and BLVer (Verify).
+ • Added BLPrf (Bridge-and-Link Prove or PC-PoK as in the paper) and BLVer (Verify).
  • Share phase: Measures BLPrf generation for real parties.
  • Dealer phase: Measures BLVer (real) + BLPrf (dummy) + Share Gen.
  • VerSS/VerRS/Trace/TrVer updated to handle expanded transcript T.
